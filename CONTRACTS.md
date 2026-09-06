@@ -55,11 +55,11 @@ If evidence fetch fails or confidence falls below threshold, the contract safely
 
 - **File**: `contracts/intent_solver_verifier.py`
 - **Network**: GenLayer Studio Network (`studionet`)
-- **Deployed Address**: [`0x17fCdDCCc704f912Ca8737e180bC59d9dB4c80A1`](https://explorer-studio.genlayer.com/address/0x17fCdDCCc704f912Ca8737e180bC59d9dB4c80A1)
-- **Deployment Transaction**: `0x58e5c046d55863c009d229f26c8fc0aadc36e6132684c97e8bbafae72294cacb`
+- **Deployed Address**: [`0x61631822286c65b7B9078ee7dfc7C64D1981e88c`](https://explorer-studio.genlayer.com/address/0x61631822286c65b7B9078ee7dfc7C64D1981e88c)
+- **Deployment Transaction**: `0x55a9727c5d1fcf4d35ed474a353777911c92d5d108939ddeca2805bd0ced6a42`
 
 ### Purpose
-Verifies that an off-chain intent solver (e.g. DEX aggregator, routing auctioneer, account abstraction bundler) fulfilled the user's natural language execution constraints without slippage exploitation or frontrunning before releasing settlement funds and solver bonds.
+Verifies that an off-chain intent solver (e.g. DEX aggregator, routing auctioneer, account abstraction bundler) fulfilled the user's natural language execution constraints without slippage exploitation or frontrunning before releasing settlement funds and solver bonds. Directly fetches authoritative on-chain transaction evidence from block explorer or RPC endpoints inside the non-deterministic flow.
 
 ### Constructor
 ```python
@@ -68,7 +68,6 @@ def __init__(
     user: Address,
     solver: Address,
     intent_spec: str,
-    tolerance_milli: int = 200,
 )
 ```
 
@@ -81,12 +80,11 @@ def __init__(
 - `settled: bool` - One-way completion latch.
 - `verdict: str` - `UNSETTLED`, `FULFILLED`, or `SLASHED`.
 - `claimable: TreeMap[Address, u256]` - Pull-payment balances.
-- `tolerance_milli: u256` - Allowed spread in validator execution quality scores.
 
 ### Consensus & Equivalence Principle
-- Closure `evaluate_intent()` feeds user constraints and solver execution receipt into `gl.nondet.exec_prompt`.
-- Principle: `gl.eq_principle.prompt_comparative` requires validators to agree on `fulfilled: bool`, match quality scores within `tolerance_milli`, and concur on outcome (`PASS` vs `FAIL`).
-- **Independent Validation**: Enforces `expected_outcome == "PASS" if (fulfilled and score_milli >= 700) else "FAIL"`.
+- Closure `evaluate_execution()` fetches live transaction evidence via `gl.nondet.web.render(evidence_url, mode="text")` and feeds user constraints, expected transaction hash, and authoritative trace into `gl.nondet.exec_prompt`.
+- Principle: `gl.eq_principle.prompt_comparative` requires validators to agree on `confirmed: bool`, agree on `fulfilled: bool`, and reach exact categorical consensus on `outcome` (`PASS` vs `FAIL`).
+- **Independent Validation**: Enforces `expected_outcome == "PASS" if (confirmed and fulfilled) else "FAIL"`.
 
 ### Economic Settlement
 - `PASS`: Solver receives user escrow + bond deposit.
@@ -133,29 +131,28 @@ def __init__(
 
 - **File**: `contracts/agent_slasher.py`
 - **Network**: GenLayer Studio Network (`studionet`)
-- **Deployed Address**: [`0x4Cb0d78790A58cFCBB01e1b18bdad399d202e098`](https://explorer-studio.genlayer.com/address/0x4Cb0d78790A58cFCBB01e1b18bdad399d202e098)
-- **Deployment Transaction**: `0x6d420698047fd01ca38e4098a2bfb648b01b004263355ccb45df88fb6d673dc9`
+- **Deployed Address**: [`0x9B76cD8bCd2EB012cd2018dE59B930e0B4d78CF9`](https://explorer-studio.genlayer.com/address/0x9B76cD8bCd2EB012cd2018dE59B930e0B4d78CF9)
+- **Deployment Transaction**: `0x7db9e4439d4a090d9b43c235b2e86fa621e2ab3e998c3be27ffd4911c338ef04`
 
 ### Purpose
-Staking and slash enforcement registry for autonomous AI agents and automated bots. Agents lock economic collateral alongside a declared operational policy. If a bot behaves maliciously, any observer can submit the incident trace; validators audit the trace against the policy and slash misaligned collateral.
+Staking and slash enforcement registry for autonomous AI agents and automated bots. Agents lock economic collateral alongside a declared operational policy. If a bot behaves maliciously, any observer can submit the incident trace; validators audit the trace against the policy and slash misaligned collateral using exact canonical discrete severity buckets.
 
 ### Constructor
 ```python
-def __init__(self, treasury: Address, tolerance_pct: int = 20)
+def __init__(self, treasury: Address)
 ```
 
 ### Storage Layout
 - `treasury: Address` - Protocol treasury destination for slashed funds.
-- `tolerance_pct: u256` - Allowed discrepancy in validator slash percentage calculations.
 - `stakes: TreeMap[Address, u256]` - Collateral balances per agent.
 - `policies: TreeMap[Address, str]` - Plain-text operational policies per agent.
 - `claimable: TreeMap[Address, u256]` - Pull-payment reward balances.
 
 ### Consensus & Equivalence Principle
-- Closure `evaluate_incident()` analyzes the incident trace against the bot's declared policy.
-- Principle: `gl.eq_principle.prompt_comparative` ensures validators agree on `violation: bool`, have `slash_pct` within `tolerance_pct`, and agree on action (`SLASH` vs `DISMISS`).
-- **Independent Validation**: Enforces `expected_action == "SLASH" if (violation and slash_pct > 0) else "DISMISS"`.
-- Slashing accounting: 50% of slashed stake rewards the whistleblower reporter, and 50% is credited to the treasury.
+- Closure `evaluate_incident()` analyzes the incident trace against the bot's declared policy and assigns an exact canonical tier: `NONE` (0%), `MINOR` (25%), `MAJOR` (50%), or `CRITICAL` (100%).
+- Principle: `gl.eq_principle.prompt_comparative` ensures validators agree on `violation: bool`, match exactly on the canonical `tier` string (`NONE`, `MINOR`, `MAJOR`, `CRITICAL`), and agree on action (`SLASH` vs `DISMISS`).
+- **Independent Validation**: Enforces `expected_action == "SLASH" if (violation and tier != "NONE") else "DISMISS"`.
+- Slashing accounting: Slash percentage is strictly derived from the agreed canonical bucket (100% deterministic). 50% of slashed stake rewards the whistleblower reporter, and 50% is credited to the treasury.
 
 ---
 
@@ -163,29 +160,28 @@ def __init__(self, treasury: Address, tolerance_pct: int = 20)
 
 - **File**: `contracts/spec_bounty.py`
 - **Network**: GenLayer Studio Network (`studionet`)
-- **Deployed Address**: [`0xf9451c01522063BE7f2b41E95fd10f84a695aC23`](https://explorer-studio.genlayer.com/address/0xf9451c01522063BE7f2b41E95fd10f84a695aC23)
-- **Deployment Transaction**: `0x9bc104c9b56205b4468bd78fbb3582fe0bebac350321034dc3ac44cfbcc45341`
+- **Deployed Address**: [`0x02A3ef75206C58D49201a4E66249f0f57C5d8D47`](https://explorer-studio.genlayer.com/address/0x02A3ef75206C58D49201a4E66249f0f57C5d8D47)
+- **Deployment Transaction**: `0xcf4699750e9b52e74e9c3f9af63fb060698f85bf5ad2cef652a5aedab9b37e15`
 
 ### Purpose
-Autonomous bug bounty pool triaging vulnerability submissions against a plain-text scope policy. Categorizes severity, computes reward amounts within deterministic caps, and credits payouts.
+Autonomous bug bounty pool triaging vulnerability submissions against a plain-text scope policy. Categorizes severity into exact canonical discrete buckets and computes reward amounts strictly derived from the agreed bucket.
 
 ### Constructor
 ```python
-def __init__(self, owner: Address, scope: str, tolerance_pct: int = 20)
+def __init__(self, owner: Address, scope: str)
 ```
 
 ### Storage Layout
 - `owner: Address` - Program manager.
 - `scope: str` - Written scope policy (in-scope targets, out-of-scope bugs).
 - `pool_balance: u256` - Active funding pool.
-- `tolerance_pct: u256` - Allowed spread in reward percentages.
 - `claims: DynArray[BountyClaim]` - History of evaluated submissions.
 - `claimable: TreeMap[Address, u256]` - Bounty reward pull balances.
 
 ### Consensus & Equivalence Principle
-- Closure `evaluate_submission()` classifies vulnerability severity into tiers: `CRITICAL` (capped at 100%), `HIGH` (capped at 50%), `MEDIUM` (capped at 20%), or `NONE` (0%).
-- Principle: `gl.eq_principle.prompt_comparative` requires exact agreement on validity and severity tier, with `payout_pct` within tolerance.
-- **Independent Validation**: Asserts `payout_pct <= max_allowed` for the judged tier before pool deduction.
+- Closure `evaluate_submission()` classifies vulnerability severity into exact canonical tiers: `CRITICAL` (fixed 50% of active pool), `HIGH` (fixed 25% of active pool), `MEDIUM` (fixed 10% of active pool), or `NONE` (0%).
+- Principle: `gl.eq_principle.prompt_comparative` requires exact agreement on validity and exact matching on the canonical `severity` string (`CRITICAL`, `HIGH`, `MEDIUM`, `NONE`).
+- **Independent Validation**: Payout is strictly calculated from the agreed bucket (`50%` for CRITICAL, `25%` for HIGH, `10%` for MEDIUM, `0%` for NONE), ensuring 100% deterministic transfers across all validators.
 
 ---
 
@@ -260,11 +256,11 @@ def __init__(
 
 - **File**: `contracts/multi_source_insurance.py`
 - **Network**: GenLayer Studio Network (`studionet`)
-- **Deployed Address**: [`0x2585C52fdC2B463Af9522EecD60027eDBfb3e3D4`](https://explorer-studio.genlayer.com/address/0x2585C52fdC2B463Af9522EecD60027eDBfb3e3D4)
-- **Deployment Transaction**: `0xf87b7ef89ed9161779b8a20d63ae9adcb4842063121368692693caa433030816`
+- **Deployed Address**: [`0xB01f2103b82c720E08aCBeB91bCEE1bCd5535cC0`](https://explorer-studio.genlayer.com/address/0xB01f2103b82c720E08aCBeB91bCEE1bCd5535cC0)
+- **Deployment Transaction**: `0x49b8d5a69449bbb47f4be572a927dfb23a26beba4c9da99ca6942fc760c42d92`
 
 ### Purpose
-Parametric disaster insurance pool. Requires independent corroboration across multiple distinct web feeds (e.g. NOAA, USGS, meteorological feeds) before releasing insurance claim disbursements.
+Parametric disaster insurance pool. Requires independent corroboration across multiple distinct web feeds (e.g. NOAA, USGS, meteorological feeds) before releasing insurance claim disbursements using exact canonical disaster severity tiers.
 
 ### Constructor
 ```python
@@ -274,7 +270,6 @@ def __init__(
     incident_condition: str,
     source_url_1: str,
     source_url_2: str,
-    tolerance_pct: int = 25,
 )
 ```
 
@@ -285,11 +280,10 @@ def __init__(
 - `source_url_2: str` - Secondary corroborating agency feed.
 - `pool_balance: u256` - Active insurance capital pool.
 - `claim_settled: bool` - One-way claim resolution latch.
-- `severity_pct: u256` - Evaluated incident severity (0..100%).
-- `tolerance_pct: u256` - Allowed variance in severity scoring.
+- `severity_tier: str` - Evaluated canonical disaster tier (`CATASTROPHIC`, `SEVERE`, `MODERATE`, `NONE`).
 - `claimable: TreeMap[Address, u256]` - Pull-payment disbursement ledger.
 
 ### Consensus & Equivalence Principle
-- Closure `corroborate_incident()` fetches data feeds via `gl.nondet.web.render` and determines whether both feeds corroborate the parametric condition.
-- Principle: `gl.eq_principle.prompt_comparative` requires agreement on `confirmed: bool` and action (`PAYOUT` vs `DENY`), with severity scores within tolerance.
-- **Independent Validation**: Asserts `expected_action == "PAYOUT" if (confirmed and severity_pct > 0) else "DENY"`.
+- Closure `corroborate_incident()` fetches data feeds via `gl.nondet.web.render` and assigns an exact canonical disaster tier: `CATASTROPHIC` (100% of pool), `SEVERE` (50% of pool), `MODERATE` (25% of pool), or `NONE` (0%).
+- Principle: `gl.eq_principle.prompt_comparative` requires agreement on `confirmed: bool`, exact matching on the canonical `tier` string (`CATASTROPHIC`, `SEVERE`, `MODERATE`, `NONE`), and agreement on action (`PAYOUT` vs `DENY`).
+- **Independent Validation**: Enforces `expected_action == "PAYOUT" if (confirmed and tier != "NONE") else "DENY"`. Payout percentage is deterministically derived from the canonical tier (100% deterministic).

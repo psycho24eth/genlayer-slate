@@ -7,20 +7,23 @@ PURPOSE
   Agents lock economic collateral alongside a plain-text operating policy or SLA.
   When an agent acts maliciously or violates its rules, whistleblowers submit the
   incident trace. Validators audit the incident against the policy, slash misaligned
-  stake, reward the reporter, and direct the remainder to protocol treasury.
+  stake based on canonical discrete severity buckets, reward the reporter, and direct
+  the remainder to protocol treasury.
 
 CONSENSUS
   Consensus uses the COMPARATIVE equivalence principle. Each validator independently
   audits the agent's incident trace against its registered policy. Validators
-  determine if a breach occurred and calculate a slash percentage (0..100%).
-  Consensus requires agreement on the violation verdict and that slash percentages
-  align within the specified tolerance. Slashes and treasury credits execute only
-  after consensus is finalized.
+  determine if a breach occurred and select an exact canonical discrete severity tier:
+  NONE (0%), MINOR (25%), MAJOR (50%), or CRITICAL (100%).
+  Consensus requires exact categorical agreement on both the violation verdict and
+  the canonical tier string. Slashing calculations and treasury credits execute only
+  after consensus is finalized and are 100% deterministically derived from the agreed tier.
 
 STATE DESIGN
-  - Staking ledger mapping agent Address to locked stake (`stakes: TreeMap[Address, u256]`).
-  - Immutable policy registry per agent (`policies: TreeMap[Address, str]`).
-  - Non-custodial pull-payment ledger (`claimable: TreeMap[Address, u256]`).
+  - Staking ledger mapping agent Address to locked stake (stakes: TreeMap[Address, u256]).
+  - Immutable policy registry per agent (policies: TreeMap[Address, str]).
+  - Non-custodial pull-payment ledger (claimable: TreeMap[Address, u256]).
+  - Deterministic discrete bucket mapping guarantees zero percentage drift across validators.
   - Strict integer math prevents underflow/overflow during slash splits.
 
 REUSE
@@ -74,15 +77,12 @@ def send_native(recipient: Address, amount: int) -> None:
 
 class AgentSlasher(gl.Contract):
     treasury: Address
-    tolerance_pct: u256
     stakes: TreeMap[Address, u256]
     policies: TreeMap[Address, str]
     claimable: TreeMap[Address, u256]
 
-    def __init__(self, treasury: Address, tolerance_pct: int = 20):
-        require(0 < tolerance_pct <= 50, "invalid tolerance percentage")
+    def __init__(self, treasury: Address):
         self.treasury = treasury
-        self.tolerance_pct = u256(tolerance_pct)
 
     @gl.public.write.payable
     def register_agent(self, policy: str) -> None:
@@ -103,7 +103,6 @@ class AgentSlasher(gl.Contract):
         require(len(policy) > 0, "no registered policy found")
         require(len(incident_log.strip()) > 0, "empty incident log")
 
-        tol = int(self.tolerance_pct)
         log_snippet = incident_log.strip()[:3500]
 
         def evaluate_incident() -> str:
@@ -115,27 +114,36 @@ AGENT OPERATIONAL POLICY:
 INCIDENT LOG / EXECUTION TRACE:
 {log_snippet}
 
-Determine whether the agent violated its declared policy. If so, specify the recommended slash percentage (0 to 100).
+Determine whether the agent violated its declared policy and assign an exact canonical severity tier:
+- NONE: No violation occurred or incident is within acceptable policy bounds (0% slash).
+- MINOR: Low-severity infraction or minor non-compliance (25% slash).
+- MAJOR: Significant operational failure or policy breach (50% slash).
+- CRITICAL: Catastrophic failure, malicious exploit, or complete breach of trust (100% slash).
 
 Return strict JSON only with no markdown wrapping:
 {{
   "violation": true or false,
-  "slash_pct": <integer between 0 and 100>,
+  "tier": "NONE" | "MINOR" | "MAJOR" | "CRITICAL",
   "reason": "<summary in <= 20 words>"
 }}"""
             raw = gl.nondet.exec_prompt(prompt)
             data = parse_json_response(raw)
 
             violation = bool(data.get("violation", False))
-            slash_pct = int(data.get("slash_pct", 0))
-            slash_pct = max(0, min(100, slash_pct))
-            reason = str(data.get("reason", "")).strip()[:120]
+            tier = str(data.get("tier", "NONE")).strip().upper()
+            if tier not in ("NONE", "MINOR", "MAJOR", "CRITICAL"):
+                tier = "NONE"
 
-            action = "SLASH" if (violation and slash_pct > 0) else "DISMISS"
+            if not violation or tier == "NONE":
+                violation = False
+                tier = "NONE"
+
+            reason = str(data.get("reason", "")).strip()[:120]
+            action = "SLASH" if (violation and tier != "NONE") else "DISMISS"
             return canonical(
                 {
                     "violation": violation,
-                    "slash_pct": slash_pct,
+                    "tier": tier,
                     "reason": reason,
                     "action": action,
                 }
@@ -144,8 +152,8 @@ Return strict JSON only with no markdown wrapping:
         principle = (
             "The two validators audit the agent incident log against its declared policy. "
             "They are EQUIVALENT if and only if: (1) both agree on the 'violation' boolean, "
-            f"(2) their slash_pct values differ by at most {tol} percentage points, and "
-            "(3) their 'action' values match ('SLASH' or 'DISMISS'). If violation determination diverges, "
+            "(2) their 'tier' values match exactly ('NONE', 'MINOR', 'MAJOR', or 'CRITICAL'), and "
+            "(3) their 'action' values match ('SLASH' or 'DISMISS'). If violation or tier determination diverges, "
             "they are NOT equivalent."
         )
 
@@ -153,13 +161,17 @@ Return strict JSON only with no markdown wrapping:
         parsed = json.loads(agreed)
 
         violation = bool(parsed["violation"])
-        slash_pct = int(parsed["slash_pct"])
+        tier = str(parsed["tier"])
         action = str(parsed["action"])
-        expected_action = "SLASH" if (violation and slash_pct > 0) else "DISMISS"
+        expected_action = "SLASH" if (violation and tier != "NONE") else "DISMISS"
         require(action == expected_action, "slash determination violates bounds")
+        require(tier in ("NONE", "MINOR", "MAJOR", "CRITICAL"), "invalid slash tier")
 
         if action == "SLASH":
-            slash_amount = (current_stake * slash_pct) // 100
+            pct = 25 if tier == "MINOR" else (50 if tier == "MAJOR" else (100 if tier == "CRITICAL" else 0))
+            require(pct > 0, "positive slash percentage required")
+
+            slash_amount = (current_stake * pct) // 100
             reporter_reward = slash_amount // 2
             treasury_cut = slash_amount - reporter_reward
 

@@ -5,20 +5,23 @@ SLATE -- 08: MultiSourceInsurance
 PURPOSE
   Parametric disaster and event insurance pool. Requires independent corroboration
   across multiple web feeds (e.g. government weather agencies, seismic sensors, news feeds)
-  before releasing insurance claim disbursements. Protects pools against single-oracle
-  faults and spoofed data.
+  before releasing insurance claim disbursements based on exact canonical disaster tiers.
+  Protects pools against single-oracle faults and spoofed data.
 
 CONSENSUS
   Consensus uses the COMPARATIVE equivalence principle. Each validator independently
   fetches the configured web sources and determines whether the parametric condition
-  was met, estimating severity from 0 to 100%. Consensus requires agreement on the
-  confirmation boolean and that severity assessments align within tolerance.
-  Claim payouts are credited only upon successful multi-validator corroboration.
+  was met, assigning an exact canonical disaster severity tier:
+  CATASTROPHIC (100% of pool), SEVERE (50% of pool), MODERATE (25% of pool), or NONE (0%).
+  Consensus requires exact categorical agreement on both the confirmation boolean
+  and the canonical severity tier string. Claim payouts are credited strictly from
+  the agreed canonical bucket, guaranteeing 100% deterministic pool deductions.
 
 STATE DESIGN
   - Single parametric claim lifecycle: POOL_FUNDED -> CLAIM_EVALUATED -> SETTLED.
-  - Strict pull-payment accounting (`claimable: TreeMap[Address, u256]`).
-  - Integer percentage scaling ensures deterministic pool balance deductions.
+  - Strict pull-payment accounting (claimable: TreeMap[Address, u256]).
+  - Evaluated severity tier stored as canonical string (severity_tier: str).
+  - Integer percentage scaling from canonical buckets ensures deterministic pool balance deductions.
   - Non-deterministic web fetches are fully isolated in error-guarded closures.
 
 REUSE
@@ -77,8 +80,7 @@ class MultiSourceInsurance(gl.Contract):
     source_url_2: str
     pool_balance: u256
     claim_settled: bool
-    severity_pct: u256
-    tolerance_pct: u256
+    severity_tier: str
     claimable: TreeMap[Address, u256]
 
     def __init__(
@@ -87,12 +89,10 @@ class MultiSourceInsurance(gl.Contract):
         incident_condition: str,
         source_url_1: str,
         source_url_2: str,
-        tolerance_pct: int = 25,
     ):
         require(len(incident_condition.strip()) > 0, "empty incident condition")
         require(len(source_url_1.strip()) > 0, "empty source url 1")
         require(len(source_url_2.strip()) > 0, "empty source url 2")
-        require(0 < tolerance_pct <= 50, "invalid tolerance percentage")
 
         self.claimant = claimant
         self.incident_condition = incident_condition.strip()
@@ -100,8 +100,7 @@ class MultiSourceInsurance(gl.Contract):
         self.source_url_2 = source_url_2.strip()
         self.pool_balance = u256(0)
         self.claim_settled = False
-        self.severity_pct = u256(0)
-        self.tolerance_pct = u256(tolerance_pct)
+        self.severity_tier = "NONE"
 
     @gl.public.write.payable
     def fund_pool(self) -> None:
@@ -117,7 +116,6 @@ class MultiSourceInsurance(gl.Contract):
         cond = self.incident_condition
         url1 = self.source_url_1
         url2 = self.source_url_2
-        tol = int(self.tolerance_pct)
 
         def corroborate_incident() -> str:
             try:
@@ -144,28 +142,36 @@ DATA FEED 2 ({url2}):
 {body_2}
 
 Verify whether BOTH independent data feeds corroborate that the incident occurred.
-If confirmed, estimate the severity percentage (1 to 100). If unconfirmed or contradictory, confirmed must be false.
+If confirmed, assign an exact canonical disaster severity tier:
+- CATASTROPHIC: Total devastation or extreme catastrophe meeting top threshold (100% of pool).
+- SEVERE: Major widespread damage or intense incident (50% of pool).
+- MODERATE: Significant localized damage meeting minimum threshold (25% of pool).
+- NONE: Incident not confirmed, contradictory feeds, or below thresholds (0% payout).
 
 Return strict JSON only with no markdown wrapping:
 {{
   "confirmed": true or false,
-  "severity_pct": <integer between 0 and 100>,
+  "tier": "CATASTROPHIC" | "SEVERE" | "MODERATE" | "NONE",
   "reason": "<summary in <= 20 words>"
 }}"""
             raw = gl.nondet.exec_prompt(prompt)
             data = parse_json_response(raw)
 
             confirmed = bool(data.get("confirmed", False))
-            sev = int(data.get("severity_pct", 0))
-            sev = max(0, min(100, sev))
-            severity_pct = sev if confirmed else 0
-            reason = str(data.get("reason", "")).strip()[:120]
+            tier = str(data.get("tier", "NONE")).strip().upper()
+            if tier not in ("CATASTROPHIC", "SEVERE", "MODERATE", "NONE"):
+                tier = "NONE"
 
-            action = "PAYOUT" if (confirmed and severity_pct > 0) else "DENY"
+            if not confirmed or tier == "NONE":
+                confirmed = False
+                tier = "NONE"
+
+            reason = str(data.get("reason", "")).strip()[:120]
+            action = "PAYOUT" if (confirmed and tier != "NONE") else "DENY"
             return canonical(
                 {
                     "confirmed": confirmed,
-                    "severity_pct": severity_pct,
+                    "tier": tier,
                     "reason": reason,
                     "action": action,
                 }
@@ -174,8 +180,8 @@ Return strict JSON only with no markdown wrapping:
         principle = (
             "The two validators corroborate the disaster claim across independent feeds. "
             "They are EQUIVALENT if and only if: (1) both agree on the 'confirmed' boolean, "
-            f"(2) their severity_pct values differ by at most {tol} percentage points, and "
-            "(3) their 'action' values match ('PAYOUT' or 'DENY'). If confirmation diverges, "
+            "(2) their 'tier' values match exactly ('CATASTROPHIC', 'SEVERE', 'MODERATE', or 'NONE'), and "
+            "(3) their 'action' values match ('PAYOUT' or 'DENY'). If confirmation or tier determination diverges, "
             "they are NOT equivalent."
         )
 
@@ -183,17 +189,21 @@ Return strict JSON only with no markdown wrapping:
         parsed = json.loads(agreed)
 
         confirmed = bool(parsed["confirmed"])
-        severity_pct = int(parsed["severity_pct"])
+        tier = str(parsed["tier"])
         action = str(parsed["action"])
 
-        expected_action = "PAYOUT" if (confirmed and severity_pct > 0) else "DENY"
+        expected_action = "PAYOUT" if (confirmed and tier != "NONE") else "DENY"
         require(action == expected_action, "claim action violates corroboration logic")
+        require(tier in ("CATASTROPHIC", "SEVERE", "MODERATE", "NONE"), "invalid disaster tier")
 
         self.claim_settled = True
-        self.severity_pct = u256(severity_pct)
+        self.severity_tier = tier
 
         if action == "PAYOUT":
-            payout = (current_pool * severity_pct) // 100
+            pct = 100 if tier == "CATASTROPHIC" else (50 if tier == "SEVERE" else (25 if tier == "MODERATE" else 0))
+            require(pct > 0, "positive payout percentage required")
+
+            payout = (current_pool * pct) // 100
             self.pool_balance = u256(current_pool - payout)
             prev_claimant = int(self.claimable.get(self.claimant, u256(0)))
             self.claimable[self.claimant] = u256(prev_claimant + payout)
@@ -216,7 +226,7 @@ Return strict JSON only with no markdown wrapping:
                 "incident_condition": self.incident_condition,
                 "pool_balance": int(self.pool_balance),
                 "claim_settled": self.claim_settled,
-                "severity_pct": int(self.severity_pct),
+                "severity_tier": self.severity_tier,
                 "source_url_1": self.source_url_1,
                 "source_url_2": self.source_url_2,
             }

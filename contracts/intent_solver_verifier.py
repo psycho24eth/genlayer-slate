@@ -3,21 +3,26 @@
 SLATE -- 02: IntentSolverVerifier
 
 PURPOSE
-  Verifies that an off-chain solver's execution receipt faithfully fulfilled
-  a user's natural language transaction intent (e.g., cross-chain swaps, DEX routing,
-  MEV protection, execution deadlines) before releasing escrowed funds and solver bonds.
+  Verifies that an off-chain solver's execution faithfully fulfilled a user's natural
+  language transaction intent (e.g., cross-chain swaps, DEX routing, MEV protection,
+  execution deadlines) before releasing escrowed funds and solver bonds.
+  Fetches authoritative transaction evidence directly from block explorer or RPC endpoints
+  inside the non-deterministic verification flow rather than trusting caller-written receipts.
 
 CONSENSUS
   Consensus uses the COMPARATIVE equivalence principle. Each validator independently
-  analyzes the execution trace against the stated intent constraints.
-  Validators determine compliance, estimate execution quality, and reach consensus
-  on whether the intent was satisfied in good faith without sandwich attacks or
-  excessive slippage. Payout or penalization occurs only after consensus is finalized.
+  fetches the authoritative on-chain transaction evidence from the specified endpoint,
+  validates on-chain confirmation against the expected transaction hash, and audits the
+  execution details against the stated intent constraints.
+  Validators reach exact categorical consensus on whether the intent was satisfied in good faith
+  without sandwich attacks or excessive slippage (outcome: PASS vs FAIL). Payout or bond
+  slashing occurs strictly based on the agreed categorical verdict.
 
 STATE DESIGN
   - Dual custody: holds user settlement funds and solver fidelity bond.
   - State machine: CREATED -> FUNDED -> SETTLED.
-  - Pull-payment ledger (`claimable: TreeMap[Address, u256]`) for withdrawals.
+  - Pull-payment ledger (claimable: TreeMap[Address, u256]) for withdrawals.
+  - Direct web evidence acquisition prevents spoofed or fabricated solver receipts.
   - Deterministic invariant checks enforce that funds can never be credited twice.
 
 REUSE
@@ -69,9 +74,6 @@ def send_native(recipient: Address, amount: int) -> None:
     _NativeRecipient(recipient).emit_transfer(value=u256(amount))
 
 
-_MILLI = 1000
-
-
 class IntentSolverVerifier(gl.Contract):
     user: Address
     solver: Address
@@ -81,17 +83,14 @@ class IntentSolverVerifier(gl.Contract):
     settled: bool
     verdict: str
     claimable: TreeMap[Address, u256]
-    tolerance_milli: u256
 
     def __init__(
         self,
         user: Address,
         solver: Address,
         intent_spec: str,
-        tolerance_milli: int = 200,
     ):
         require(len(intent_spec.strip()) > 0, "empty intent specification")
-        require(0 < tolerance_milli <= 500, "invalid tolerance")
 
         self.user = user
         self.solver = solver
@@ -100,7 +99,6 @@ class IntentSolverVerifier(gl.Contract):
         self.solver_bond = u256(0)
         self.settled = False
         self.verdict = "UNSETTLED"
-        self.tolerance_milli = u256(tolerance_milli)
 
     @gl.public.write.payable
     def fund_user_escrow(self) -> None:
@@ -117,67 +115,85 @@ class IntentSolverVerifier(gl.Contract):
         self.solver_bond = u256(int(self.solver_bond) + int(gl.message.value))
 
     @gl.public.write
-    def verify_execution(self, routing_receipt: str) -> str:
+    def verify_execution(self, tx_hash: str, evidence_url: str) -> str:
         require(not self.settled, "already settled")
         require(int(self.user_deposit) > 0, "user escrow not funded")
         require(int(self.solver_bond) > 0, "solver bond not posted")
-        require(len(routing_receipt.strip()) > 0, "empty routing receipt")
+        require(len(tx_hash.strip()) > 0, "empty transaction hash")
+        require(len(evidence_url.strip()) > 0, "empty evidence url")
 
         intent = self.intent_spec
-        receipt = routing_receipt.strip()[:3500]
-        tol = int(self.tolerance_milli)
+        tx = tx_hash.strip()
+        url = evidence_url.strip()
 
-        def evaluate_intent() -> str:
+        def evaluate_execution() -> str:
+            try:
+                page_content = gl.nondet.web.render(url, mode="text")
+                body = page_content[:3500] if page_content else "[EMPTY EVIDENCE FEED]"
+            except Exception as exc:
+                body = f"[FETCH EVIDENCE FAILED: {exc}]"[:300]
+
             prompt = f"""You are a decentralized DeFi verifier auditing intent solver execution.
 
-USER INTENT:
+USER INTENT CONSTRAINTS:
 {intent}
 
-SOLVER EXECUTION RECEIPT / ON-CHAIN TRACE:
-{receipt}
+EXPECTED TRANSACTION HASH:
+{tx}
 
-Evaluate whether the solver's routing fulfilled the user's intent faithfully and without exploitative slippage or frontrunning.
+AUTHORITATIVE ON-CHAIN EXECUTION EVIDENCE ({url}):
+{body}
+
+Audit the authoritative evidence to verify:
+1. The transaction confirmed successfully on-chain and matches the expected transaction hash ({tx}).
+2. The execution fulfilled the user's intent constraints faithfully without exploitative slippage, sandwich attacks, or frontrunning.
 
 Return strict JSON only with no markdown wrapping:
 {{
+  "confirmed": true or false,
   "fulfilled": true or false,
-  "quality_score": <float 0..1 representing satisfaction of constraints>,
+  "outcome": "PASS" | "FAIL",
   "reason": "<summary in <= 20 words>"
 }}"""
             raw = gl.nondet.exec_prompt(prompt)
             data = parse_json_response(raw)
 
+            confirmed = bool(data.get("confirmed", False))
             fulfilled = bool(data.get("fulfilled", False))
-            score = float(data.get("quality_score", 0.0))
-            score = max(0.0, min(1.0, score))
-            score_milli = int(round(score * _MILLI))
-            reason = str(data.get("reason", "")).strip()[:120]
+            outcome = str(data.get("outcome", "FAIL")).strip().upper()
+            if outcome not in ("PASS", "FAIL"):
+                outcome = "FAIL"
 
-            outcome = "PASS" if (fulfilled and score_milli >= 700) else "FAIL"
+            if not (confirmed and fulfilled):
+                outcome = "FAIL"
+
+            reason = str(data.get("reason", "")).strip()[:120]
             return canonical(
                 {
+                    "confirmed": confirmed,
                     "fulfilled": fulfilled,
-                    "score_milli": score_milli,
-                    "reason": reason,
                     "outcome": outcome,
+                    "reason": reason,
                 }
             )
 
         principle = (
-            "The two validators audit the solver routing receipt. They are EQUIVALENT "
-            "if and only if: (1) both agree on the 'fulfilled' boolean, (2) their score_milli "
-            f"values differ by at most {tol}, and (3) their 'outcome' fields match ('PASS' or 'FAIL'). "
-            "If the pass/fail determination diverges, they are NOT equivalent."
+            "The two validators audit the authoritative on-chain execution evidence against the user's intent. "
+            "They are EQUIVALENT if and only if: (1) both agree on the 'confirmed' boolean, "
+            "(2) both agree on the 'fulfilled' boolean, and (3) their 'outcome' values match exactly ('PASS' or 'FAIL'). "
+            "If the categorical outcome diverges, they are NOT equivalent."
         )
 
-        agreed = gl.eq_principle.prompt_comparative(evaluate_intent, principle)
+        agreed = gl.eq_principle.prompt_comparative(evaluate_execution, principle)
         parsed = json.loads(agreed)
 
+        confirmed = bool(parsed["confirmed"])
         fulfilled = bool(parsed["fulfilled"])
-        score_milli = int(parsed["score_milli"])
         outcome = str(parsed["outcome"])
-        expected_outcome = "PASS" if (fulfilled and score_milli >= 700) else "FAIL"
-        require(outcome == expected_outcome, "consequential action violates policy bounds")
+
+        expected_outcome = "PASS" if (confirmed and fulfilled) else "FAIL"
+        require(outcome == expected_outcome, "consequential action violates verification bounds")
+        require(outcome in ("PASS", "FAIL"), "invalid outcome")
 
         total_escrow = int(self.user_deposit)
         bond = int(self.solver_bond)
@@ -187,12 +203,10 @@ Return strict JSON only with no markdown wrapping:
 
         if outcome == "PASS":
             self.verdict = "FULFILLED"
-            # Solver receives user escrow payment + their bond back
             prev_solver = int(self.claimable.get(self.solver, u256(0)))
             self.claimable[self.solver] = u256(prev_solver + total_escrow + bond)
         else:
             self.verdict = "SLASHED"
-            # Solver violated intent: user refunded escrow + awarded solver's slashed bond
             prev_user = int(self.claimable.get(self.user, u256(0)))
             self.claimable[self.user] = u256(prev_user + total_escrow + bond)
 

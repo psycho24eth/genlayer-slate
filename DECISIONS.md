@@ -106,5 +106,28 @@ Direct native token transfers inside complex decision paths (`evaluate()`, `slas
   6. Storage type safety (`u256`, `Address`, `TreeMap`, `DynArray`)
   7. No custom appeal/reroll methods
   8. Balance payout paths emit native transfer
-- Full pytest test suite (`pytest -v`) passed with 33 test cases.
+- Full pytest test suite (`pytest -v`) passed with 45 test cases.
 - All 8 contracts successfully deployed to Studionet with 5 validator consensus (`MAJORITY_AGREE`, status: `ACCEPTED`).
+
+---
+
+## 7. Canonical Discrete Payout Buckets & Authoritative Evidence Verification
+
+### Context & Reviewer Feedback
+A subsequent reviewer rejection identified two determinism and trust vulnerabilities:
+1. **Payout Variance under Comparative Consensus**: In `AgentSlasher`, `SpecBounty`, and `MultiSourceInsurance`, continuous percentages (e.g. 0-100% slash, bounty payout, or disaster severity) used a tolerance window. If validator A evaluated 30% and validator B evaluated 40% under a 20% tolerance, both agreed on the action, but the fund amount moved depended on which validator was leader.
+2. **Caller-Written Receipts**: `IntentSolverVerifier` accepted caller-written text receipts as proof of solver execution, risking falsified execution traces.
+
+### Architectural Decisions
+1. **Canonical Discrete Buckets**:
+   - `AgentSlasher`: Bound to `NONE` (0%), `MINOR` (25%), `MAJOR` (50%), and `CRITICAL` (100%).
+   - `SpecBounty`: Bound to `CRITICAL` (50% of active pool), `HIGH` (25%), `MEDIUM` (10%), and `NONE` (0%).
+   - `MultiSourceInsurance`: Bound to `CATASTROPHIC` (100% of pool), `SEVERE` (50%), `MODERATE` (25%), and `NONE` (0%).
+   - Equivalence principles require exact categorical string matching on the tier. All transfers are derived deterministically from the agreed bucket, guaranteeing zero payout drift across validators.
+2. **Authoritative Web Evidence Acquisition**:
+   - `IntentSolverVerifier` now takes `(tx_hash, evidence_url)`. Inside the zero-argument non-deterministic closure, validators independently fetch the raw block explorer or RPC trace via `gl.nondet.web.render(evidence_url, mode="text")`.
+   - The LLM prompt audits the fetched authoritative evidence to confirm the transaction is confirmed on-chain, matches `tx_hash`, and satisfies user intent constraints without frontrunning or slippage abuse.
+   - Validators reach exact comparative consensus on the categorical outcome (`PASS` vs `FAIL`).
+3. **Re-deployment on Studionet**:
+   - All 4 updated contracts deployed and verified on `studionet` with multi-validator consensus.
+

@@ -34,11 +34,10 @@ class TestHelperLogic:
         assert data["reason"] == "all good"
 
     def test_parse_json_prose_wrapped(self):
-        raw = "Here is your output:\n{\"valid\": true, \"severity\": \"HIGH\", \"payout_pct\": 50}\nThanks!"
+        raw = "Here is your output:\n{\"valid\": true, \"severity\": \"HIGH\"}\nThanks!"
         data = parse_json_response(raw)
         assert data["valid"] is True
         assert data["severity"] == "HIGH"
-        assert data["payout_pct"] == 50
 
     def test_canonical_sorts_keys(self):
         obj1 = {"z": 1, "a": 2, "m": 3}
@@ -74,15 +73,21 @@ class TestMilestoneEscrowLogic:
 
 class TestIntentSolverVerifierLogic:
     def test_intent_pass_decision(self):
+        confirmed = True
         fulfilled = True
-        score_milli = 800
-        outcome = "PASS" if (fulfilled and score_milli >= 700) else "FAIL"
+        outcome = "PASS" if (confirmed and fulfilled) else "FAIL"
         assert outcome == "PASS"
 
-    def test_intent_fail_on_low_quality(self):
+    def test_intent_fail_unconfirmed_on_chain(self):
+        confirmed = False
         fulfilled = True
-        score_milli = 600
-        outcome = "PASS" if (fulfilled and score_milli >= 700) else "FAIL"
+        outcome = "PASS" if (confirmed and fulfilled) else "FAIL"
+        assert outcome == "FAIL"
+
+    def test_intent_fail_unfulfilled_constraints(self):
+        confirmed = True
+        fulfilled = False
+        outcome = "PASS" if (confirmed and fulfilled) else "FAIL"
         assert outcome == "FAIL"
 
 
@@ -98,46 +103,82 @@ class TestSemanticDAOGuardLogic:
 
 
 class TestAgentSlasherLogic:
+    @pytest.mark.parametrize(
+        "tier,expected_pct",
+        [
+            ("CRITICAL", 100),
+            ("MAJOR", 50),
+            ("MINOR", 25),
+            ("NONE", 0),
+        ],
+    )
+    def test_canonical_slash_tiers(self, tier, expected_pct):
+        pct = 25 if tier == "MINOR" else (50 if tier == "MAJOR" else (100 if tier == "CRITICAL" else 0))
+        assert pct == expected_pct
+
     def test_slash_split_accounting(self):
         stake = 1000
-        slash_pct = 40
-        slashed = (stake * slash_pct) // 100
-        assert slashed == 400
+        # Major tier = 50%
+        pct = 50
+        slashed = (stake * pct) // 100
+        assert slashed == 500
 
         reporter_reward = slashed // 2
         treasury_cut = slashed - reporter_reward
 
-        assert reporter_reward == 200
-        assert treasury_cut == 200
+        assert reporter_reward == 250
+        assert treasury_cut == 250
         assert reporter_reward + treasury_cut == slashed
-        assert stake - slashed == 600
+        assert stake - slashed == 500
 
-    def test_odd_slash_no_funds_lost(self):
+    def test_minor_slash_no_funds_lost(self):
         stake = 1000
-        slash_pct = 25
-        slashed = (stake * slash_pct) // 100
+        pct = 25  # MINOR
+        slashed = (stake * pct) // 100
         assert slashed == 250
 
         reporter_reward = slashed // 2  # 125
         treasury_cut = slashed - reporter_reward  # 125
         assert reporter_reward + treasury_cut == slashed
+        assert stake - slashed == 750
+
+    def test_critical_slash_full_stake(self):
+        stake = 1000
+        pct = 100  # CRITICAL
+        slashed = (stake * pct) // 100
+        assert slashed == 1000
+
+        reporter_reward = slashed // 2  # 500
+        treasury_cut = slashed - reporter_reward  # 500
+        assert reporter_reward + treasury_cut == slashed
+        assert stake - slashed == 0
 
 
 class TestSpecBountyLogic:
     @pytest.mark.parametrize(
-        "sev,raw_pct,expected_cap",
+        "sev,expected_pct",
         [
-            ("CRITICAL", 100, 100),
-            ("CRITICAL", 80, 80),
-            ("HIGH", 80, 50),
-            ("MEDIUM", 50, 20),
-            ("NONE", 50, 0),
+            ("CRITICAL", 50),
+            ("HIGH", 25),
+            ("MEDIUM", 10),
+            ("NONE", 0),
         ],
     )
-    def test_bounty_tier_caps(self, sev, raw_pct, expected_cap):
-        max_allowed = 100 if sev == "CRITICAL" else (50 if sev == "HIGH" else (20 if sev == "MEDIUM" else 0))
-        payout_pct = min(raw_pct, max_allowed)
-        assert payout_pct == expected_cap
+    def test_canonical_bounty_tiers(self, sev, expected_pct):
+        pct = 50 if sev == "CRITICAL" else (25 if sev == "HIGH" else (10 if sev == "MEDIUM" else 0))
+        assert pct == expected_pct
+
+    def test_deterministic_bounty_payouts(self):
+        pool = 10000
+        for sev, expected_reward in [
+            ("CRITICAL", 5000),
+            ("HIGH", 2500),
+            ("MEDIUM", 1000),
+            ("NONE", 0),
+        ]:
+            pct = 50 if sev == "CRITICAL" else (25 if sev == "HIGH" else (10 if sev == "MEDIUM" else 0))
+            reward = (pool * pct) // 100
+            assert reward == expected_reward
 
 
 class TestDisputeCourtLogic:
@@ -192,14 +233,47 @@ class TestCrossLingualOracleLogic:
 
 
 class TestMultiSourceInsuranceLogic:
+    @pytest.mark.parametrize(
+        "tier,expected_pct",
+        [
+            ("CATASTROPHIC", 100),
+            ("SEVERE", 50),
+            ("MODERATE", 25),
+            ("NONE", 0),
+        ],
+    )
+    def test_canonical_disaster_tiers(self, tier, expected_pct):
+        pct = 100 if tier == "CATASTROPHIC" else (50 if tier == "SEVERE" else (25 if tier == "MODERATE" else 0))
+        assert pct == expected_pct
+
     def test_payout_calculation(self):
         pool = 50000
         confirmed = True
-        severity_pct = 30
-        action = "PAYOUT" if (confirmed and severity_pct > 0) else "DENY"
+        tier = "MODERATE"
+        action = "PAYOUT" if (confirmed and tier != "NONE") else "DENY"
         assert action == "PAYOUT"
 
-        payout = (pool * severity_pct) // 100
+        pct = 100 if tier == "CATASTROPHIC" else (50 if tier == "SEVERE" else (25 if tier == "MODERATE" else 0))
+        payout = (pool * pct) // 100
         remaining_pool = pool - payout
-        assert payout == 15000
-        assert remaining_pool == 35000
+        assert payout == 12500
+        assert remaining_pool == 37500
+
+    def test_catastrophic_total_payout(self):
+        pool = 50000
+        confirmed = True
+        tier = "CATASTROPHIC"
+        action = "PAYOUT" if (confirmed and tier != "NONE") else "DENY"
+        assert action == "PAYOUT"
+
+        pct = 100 if tier == "CATASTROPHIC" else (50 if tier == "SEVERE" else (25 if tier == "MODERATE" else 0))
+        payout = (pool * pct) // 100
+        remaining_pool = pool - payout
+        assert payout == 50000
+        assert remaining_pool == 0
+
+    def test_deny_on_unconfirmed(self):
+        confirmed = False
+        tier = "CATASTROPHIC"
+        action = "PAYOUT" if (confirmed and tier != "NONE") else "DENY"
+        assert action == "DENY"
